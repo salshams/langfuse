@@ -1,0 +1,338 @@
+# Each key is the node name passed to wrap_node(...).
+# input: dotted paths to pull from the node's state (first arg)
+# output: dotted paths to pull from node return dict or returned object
+#
+# Node-specific configuration
+#
+# New fields:
+#   truncate_input: true|false    -> when false: no truncation of captured input strings
+#   truncate_output: true|false   -> when false: no truncation of captured output strings
+#
+# Defaults are defined in _default below.
+
+create_folder_dao:
+  input:
+    - folder_num
+    - disability_folder_id
+    - langfuse_trace_id
+  output:
+    - folder_dao.document_ids
+    - folder_dao.documents_df.shape
+    - folder_dao.fac_df.shape
+    - folder_dao.viewer_annotation_to_doc_map
+  truncate_input: true
+  truncate_output: false
+
+enumerate_chapters_to_run_node:
+  input:
+    - folder_num
+    - folder_dao.document_ids
+  output:
+    - internal_chapters_to_run
+    - internal_pmi_facr_available
+  truncate_input: false
+  truncate_output: true
+
+# Chapter-level subgraph nodes (chapter_timeline_node build)
+subset_fac_node:
+  input:
+    - folder_num
+    - chapter
+    - folder_dao.fac_df.shape
+  output:
+    - context_df.shape
+    - diagnostic_report_context_df.shape
+  truncate_input: true
+  truncate_output: true
+
+convert_fac_to_markdown_node:
+  input:
+    - context_df.shape
+  output:
+    - mer_markdown
+    - mer_citation_lookup.keys_sample
+  truncate_input: true
+  # mer_markdown can be large; if you want it in full set truncate_output: false
+  truncate_output: true
+
+create_prompt_node:
+  input:
+    - mer_markdown
+    - chapter
+  output:
+    - prompt        # FULL prompt allowed for create_prompt_node via wrapper config
+    - prompt_sections.keys_sample
+  # prompt should often be viewable in full for debugging; default to no truncation of output prompt
+  truncate_input: true
+  truncate_output: false
+
+set_llm_shuttle_node:
+  input:
+    - prompt_sections.keys_sample
+    - prompt
+  output:
+    - azure_llm_shuttle.llm_call_config.llm_name
+    - azure_llm_shuttle.prompt_deck
+  truncate_input: true
+  truncate_output: true
+
+azure_llm_node:
+  input:
+    - azure_llm_shuttle.llm_call_config.llm_name
+    - azure_llm_shuttle.prompt_deck
+  output:
+    - azure_llm_shuttle.llm_response.raw.content       # capture raw content of LLM response
+    - azure_llm_shuttle.llm_response.parsing_error
+    - azure_llm_shuttle.llm_response.parsed.__class__.__name__
+  # LLM outputs can be large; allow disabling truncation if desired
+  truncate_input: true
+  truncate_output: false
+
+receive_llm_shuttle_node:
+  input:
+    - azure_llm_shuttle.llm_response.__class__.__name__
+  output:
+    - events.__class__.__name__
+    - markdown_output
+    - response_raw    # response_raw is already a string in the state
+  truncate_input: true
+  truncate_output: true
+
+llm_validate_events_node:
+  input:
+    - chapter_timeline_config.validation_config.llm_call_config.llm_name
+  output: []
+  truncate_input: true
+  truncate_output: true
+
+invoke_llm_self_check_node_01:
+  input:
+    - folder_num
+  output:
+    - internal:validation_states.__class__.__name__
+  truncate_input: true
+  truncate_output: true
+invoke_llm_self_check_node_12:
+  input:
+    - folder_num
+  output:
+    - internal:validation_states.__class__.__name__
+  truncate_input: true
+  truncate_output: true
+
+finish_llm_self_check_node:
+  input: []
+  output: []
+  truncate_input: true
+  truncate_output: true
+
+recombine_timeline_node:
+  input:
+    - events.__class__.__name__
+    - validation_states.__class__.__name__
+  output:
+    - events.__class__.__name__
+  truncate_input: true
+  truncate_output: true
+
+exact_quote_check_node:
+  input:
+    - events.__class__.__name__
+    - context_df.shape
+  output:
+    - events.__class__.__name__
+  truncate_input: true
+  truncate_output: true
+
+parse_structured_output_node:
+  input:
+    - events.__class__.__name__
+  output:
+    - markdown_output
+  truncate_input: true
+  truncate_output: true
+
+replace_citations_node:
+  input:
+    - markdown_output
+    - mer_citation_lookup.keys_sample
+  output:
+    - markdown_output
+    - events.__class__.__name__
+  truncate_input: true
+  truncate_output: true
+
+set_overview_statement_llm_shuttle_node:
+  input:
+    - events.__class__.__name__
+    - chapter_overview
+  output:
+    - azure_llm_shuttle.prompt_deck
+    - azure_llm_shuttle.llm_call_config.llm_name
+  truncate_input: true
+  truncate_output: true
+
+azure_llm_overview_node:
+  input:
+    - azure_llm_shuttle.prompt_deck
+  output:
+    - azure_llm_shuttle.llm_response.raw.content
+    - azure_llm_shuttle.llm_response.parsed.__class__.__name__
+  truncate_input: true
+  truncate_output: false
+
+receive_llm_shuttle_overview_statement_node:
+  input:
+    - azure_llm_shuttle.llm_response.__class__.__name__
+  output:
+    - chapter_overview
+  truncate_input: true
+  truncate_output: true
+
+receive_llm_shuttle_overview_statement_dummy_node:
+  input: []
+  output: []
+  truncate_input: true
+  truncate_output: true
+
+update_markdown_with_overview:
+  input:
+    - chapter_overview
+    - markdown_output
+  output:
+    - markdown_output
+  truncate_input: true
+  truncate_output: true
+
+save_response_node:
+  input: []
+  output: []
+  truncate_input: true
+  truncate_output: true
+
+create_structured_response_node:
+  input:
+    - events.__class__.__name__
+    - chapter_overview
+  output:
+    - structured_timeline.keys_sample
+  truncate_input: true
+  truncate_output: true
+
+scoring_node:
+  input:
+    - events.__class__.__name__
+    - chapter_timeline_config.llm_scoring_config.scoring_metrics
+    - folder_dao.fac_df.shape
+  output:
+    - metrics
+  truncate_input: true
+  truncate_output: true
+
+load_archived_summary_node:
+  input:
+    - folder_num
+  output:
+    - archived_summary.keys_sample
+  truncate_input: true
+  truncate_output: true
+
+# LLMSelfCheck subgraph nodes
+llm_self_check.subset_fac_node:
+  input:
+    - uid
+    - fac.shape
+  output:
+    - fac_section.shape
+    - fac_cited.shape
+  truncate_input: true
+  truncate_output: true
+
+llm_self_check.check_statement_llm_node:
+  input:
+    - statement.statement_text
+  output:
+    - azure_llm_shuttle.prompt_deck
+  truncate_input: true
+  truncate_output: true
+
+llm_self_check.azure_llm_node:
+  input:
+    - azure_llm_shuttle.prompt_deck
+  output:
+    - azure_llm_shuttle.llm_response.parsed.__class__.__name__
+  truncate_input: true
+  truncate_output: true
+
+llm_self_check.max_retry_node:
+  input:
+    - retries
+  output:
+    - statement.statement_text
+  truncate_input: true
+  truncate_output: true
+
+llm_self_check.rewrite_prompt_node:
+  input:
+    - statement.statement_text
+  output:
+    - azure_llm_shuttle.prompt_deck
+  truncate_input: true
+  truncate_output: true
+
+llm_self_check.rewrite_llm_node:
+  input:
+    - azure_llm_shuttle.prompt_deck
+  output:
+    - azure_llm_shuttle.llm_response.parsed.__class__.__name__
+  truncate_input: true
+  truncate_output: true
+
+llm_self_check.post_rewrite_node:
+  input:
+    - azure_llm_shuttle.llm_response.parsed.__class__.__name__
+  output:
+    - statement.statement_text
+  truncate_input: true
+  truncate_output: true
+
+# Chapter-fan-in / merge nodes
+chapter_summary_completed_node:
+  input:
+    - langfuse_trace_id
+    - internal_list_of_chapter_timelines
+  output: []
+  truncate_input: true
+  truncate_output: true
+
+chapter_summary_deep_merge_node:
+  input:
+    - internal_list_of_chapter_timelines
+    - folder_num
+    - langfuse_trace_id
+  output:
+    - case_timeline.keys_sample
+    - case_timeline.chapter_timelines.keys_sample
+  truncate_input: true
+  truncate_output: true
+
+pydantic_to_dict_node:
+  input:
+    - folder_num
+    - case_timeline.chapter_timelines.keys_sample
+    - folder_dao.document_ids
+    - document_ids
+  output:
+    - case_timeline.chapter_timelines.keys_sample
+    - langfuse_trace_id
+  truncate_input: true
+  truncate_output: true
+
+_default:
+  input:
+    - folder_num
+    - disability_folder_id
+  output: []
+  # default behavior: truncate (current behavior)
+  truncate_input: true
+  truncate_output: true
