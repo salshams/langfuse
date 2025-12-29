@@ -1,0 +1,692 @@
+import re
+import copy
+import langfuse
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+import logging
+
+from openai import APITimeoutError
+import numpy as np
+import json
+import os
+
+from summarization.workflow.nodes.chapter_timeline_nodes.scoring_node import  scoring_node
+from summarization.workflow.nodes.chapter_timeline_nodes.mer_selection_node import MERSelection
+from summarization.workflow.graph.summary_base_models import (
+        ChapterTimeline,
+        TimelineEvent,
+        ChapterTimeline,
+        ChapterTimelineState,
+        TimelineResponseStructure,
+        ValidationState,
+        ChapterTimelineValidationState
+)
+
+
+from summarization.workflow.nodes.chapter_timeline_nodes.MER_text_to_prompt_node import convert_fac_to_markdown_node
+from summarization.workflow.nodes.azure_llm_node import azure_llm_node
+from summarization.workflow.nodes.exact_quote_check_node import exact_quote_check_node
+from summarization.workflow.nodes.chapter_timeline_nodes.parse_structured_output_node \
+    import parse_structured_output_node
+
+from summarization.workflow.edges.self_check_routing import self_check_routing
+from summarization.workflow.edges.write_overview_routing import write_overview_routing
+from summarization.workflow.edges.scoring_eval_routing import scoring_eval_routing
+
+from summarization.data_access.folder_dao import FolderDAO
+
+from summarization.workflow.graph.summary_base_models import (
+    ChapterTimeline,
+    ChapterTimelineConfig
+)
+from summarization.workflow.nodes.llm_self_check_node import LLMSelfCheckNode
+
+from summarization.workflow.utils.parse_evidence_citations import parse_evidence_citations
+
+from pipeline_service.parameters.parameters import Parameters
+
+from summarization.workflow.utils.langfuse_node_wrapper import wrap_node # Added for limited Tracing
+
+class ChapterTimelineNode:
+    def __init__(self):
+        """Constructor"""
+
+        pass
+
+
+    @staticmethod
+    def build(ch: str):
+        """
+        Build the chapter summary graph
+
+        Args:
+            ch (str): The chapter number
+
+        Returns:
+            CompiledStateGraph: The compiled graph for chapter timeline
+        """
+
+        logging.info(f'chapter timeline node build started for chapter {ch}...')
+
+        builder = StateGraph(ChapterTimelineState, output_schema=ChapterTimeline)
+
+        builder.add_edge(START, f'subset_fac_node')
+
+        # Subset the FAC to the relevant chapter and info
+        # builder.add_node('subset_fac_node', MERSelection.mer_selection_node)
+        builder.add_node('subset_fac_node', wrap_node(MERSelection.mer_selection_node, 'subset_fac_node'))
+        builder.add_edge("subset_fac_node", "convert_fac_to_markdown_node")
+
+        # Convert FAC MER to Markdown for prompt
+        # builder.add_node('convert_fac_to_markdown_node', convert_fac_to_markdown_node)
+        builder.add_node('convert_fac_to_markdown_node', wrap_node(convert_fac_to_markdown_node, 'convert_fac_to_markdown_node'))
+        builder.add_edge("convert_fac_to_markdown_node", "create_prompt_node")
+
+        # Create Prompt
+        # builder.add_node('create_prompt_node', ChapterTimelineNode.create_prompt_node)
+        builder.add_node('create_prompt_node', wrap_node(ChapterTimelineNode.create_prompt_node, 'create_prompt_node'))
+        builder.add_edge("create_prompt_node", "set_llm_shuttle_node")
+
+        # Set Prompt Shuttle to run
+        # builder.add_node('set_llm_shuttle_node', ChapterTimelineNode.set_llm_shuttle_node)
+        builder.add_node('set_llm_shuttle_node', wrap_node(ChapterTimelineNode.set_llm_shuttle_node, 'set_llm_shuttle_node'))
+        builder.add_edge("set_llm_shuttle_node", "azure_llm_node")
+
+        # Run Azure LLM
+        # builder.add_node("azure_llm_node", azure_llm_node)
+        builder.add_node('azure_llm_node', wrap_node(azure_llm_node, 'azure_llm_node'))
+        builder.add_edge("azure_llm_node", 'receive_llm_shuttle_node')
+
+        # Return the llm response in shuttle back to graph network
+        # builder.add_node("receive_llm_shuttle_node", ChapterTimelineNode.receive_llm_shuttle_node)
+        builder.add_node('receive_llm_shuttle_node', wrap_node(ChapterTimelineNode.receive_llm_shuttle_node, 'receive_llm_shuttle_node'))
+        builder.add_edge('receive_llm_shuttle_node', 'exact_quote_check_node')
+
+        # Create conditional edge whether to run self-check based on config
+        builder.add_conditional_edges("receive_llm_shuttle_node",
+                    self_check_routing,
+                    {'quote_check_only': 'exact_quote_check_node',
+                     'llm_self_check': 'llm_validate_events_node'
+                     })
+
+        builder.add_node("llm_validate_events_node", lambda x: None) # Dummy node
+
+        # This conditional edge is actaully a map-reduce
+        builder.add_conditional_edges("llm_validate_events_node",
+                                      ChapterTimelineNode.validate_events_node,
+                                      [f"invoke_llm_self_check_node_{ch}"]
+                                      )
+
+        llm_self_check_graph = LLMSelfCheckNode.build()
+
+        async def _invoke_llm_self_check_node(state: ChapterTimelineState):
+            logging.info(f'invoke_validation_subgraph started for {state.folder_num}, {ch}')
+            r = await llm_self_check_graph.ainvoke(state)
+            logging.info(f'invoke_validation_subgraph finished for {state.folder_num}, {ch}')
+            return {'validation_states': [r]}
+
+        # builder.add_node(f"invoke_llm_self_check_node_{ch}", _invoke_llm_self_check_node)
+        builder.add_node(f"invoke_llm_self_check_node_{ch}", wrap_node(_invoke_llm_self_check_node, f"invoke_llm_self_check_node_{ch}"))
+        builder.add_edge(f"invoke_llm_self_check_node_{ch}", 'finish_llm_self_check_node')
+
+        builder.add_node("finish_llm_self_check_node", lambda x: None) # Dummy node
+        builder.add_edge("finish_llm_self_check_node", "recombine_timeline_node")
+
+        builder.add_node("recombine_timeline_node", ChapterTimelineNode.recombine_timeline_node)
+        builder.add_edge("recombine_timeline_node", "exact_quote_check_node")
+
+        # builder.add_node('exact_quote_check_node', exact_quote_check_node)
+        builder.add_node('exact_quote_check_node', wrap_node(exact_quote_check_node, 'exact_quote_check_node'))
+        builder.add_edge("exact_quote_check_node", "parse_structured_output_node")
+
+        # builder.add_node("parse_structured_output_node", parse_structured_output_node)
+        builder.add_node('parse_structured_output_node', wrap_node(parse_structured_output_node, 'parse_structured_output_node'))
+        builder.add_edge("parse_structured_output_node", "replace_citations_node")
+
+        # Replace Citations
+        # builder.add_node("replace_citations_node", ChapterTimelineNode.replace_citations_node)
+        builder.add_node('replace_citations_node', wrap_node(ChapterTimelineNode.replace_citations_node, 'replace_citations_node'))
+        builder.add_conditional_edges("replace_citations_node",
+                    write_overview_routing,
+                    {'write_overview': 'set_overview_statement_llm_shuttle_node',
+                    'skip_overview': 'save_response_node'}
+        )
+
+        # Make overview summary
+        # builder.add_node("set_overview_statement_llm_shuttle_node", ChapterTimelineNode.set_overview_statement_llm_shuttle_node)
+        builder.add_node('set_overview_statement_llm_shuttle_node',
+                         wrap_node(ChapterTimelineNode.set_overview_statement_llm_shuttle_node, 'set_overview_statement_llm_shuttle_node'))
+        builder.add_edge("set_overview_statement_llm_shuttle_node", "azure_llm_overview_node")
+
+        # builder.add_node("azure_llm_overview_node", azure_llm_node)
+        builder.add_node('azure_llm_overview_node', wrap_node(azure_llm_node, 'azure_llm_overview_node'))
+        builder.add_edge("azure_llm_overview_node", 'receive_llm_shuttle_overview_statement_node')
+
+        # builder.add_node("receive_llm_shuttle_overview_statement_node", ChapterTimelineNode.receive_llm_shuttle_overview_statement_node)
+        builder.add_node('receive_llm_shuttle_overview_statement_node',
+                         wrap_node(ChapterTimelineNode.receive_llm_shuttle_overview_statement_node, 'receive_llm_shuttle_overview_statement_node'))
+        builder.add_edge("receive_llm_shuttle_overview_statement_node", 'receive_llm_shuttle_overview_statement_dummy_node')
+
+        # Combines threads in some map-reduce issues when self-check and overview are running
+        builder.add_node("receive_llm_shuttle_overview_statement_dummy_node", lambda x: None)
+        builder.add_edge("receive_llm_shuttle_overview_statement_dummy_node", 'update_markdown_with_overview')
+
+
+        # builder.add_node("update_markdown_with_overview", ChapterTimelineNode.update_markdown_with_overview)
+        builder.add_node('update_markdown_with_overview', wrap_node(ChapterTimelineNode.update_markdown_with_overview, 'update_markdown_with_overview'))
+        builder.add_edge("update_markdown_with_overview", 'save_response_node')
+
+        # Save Response
+        # builder.add_node('save_response_node', ChapterTimelineNode.save_response_node)
+        builder.add_node('save_response_node', wrap_node(ChapterTimelineNode.save_response_node, 'save_response_node'))
+        builder.add_edge('save_response_node', 'create_structured_response_node')
+
+        # Build Structured Response with conditional to do scoring after it
+        # builder.add_node('create_structured_response_node', ChapterTimelineNode.create_structured_response_node)
+        builder.add_node('create_structured_response_node',
+                         wrap_node(ChapterTimelineNode.create_structured_response_node, 'create_structured_response_node'))
+        builder.add_conditional_edges("create_structured_response_node",
+                    scoring_eval_routing,
+                    {'do_scoring': 'scoring_node','skip_scoring': END})
+
+        # Scoring node
+        # builder.add_node('scoring_node', scoring_node)
+        builder.add_node('scoring_node', wrap_node(scoring_node, 'scoring_node'))
+
+        logging.info(f'chapter timeline node build completed for chapter {ch}...')
+        return builder.compile(name=f'chapter_timeline_node_{ch}')
+
+    # Define Nodes
+    @staticmethod
+    async def create_prompt_node(state: ChapterTimelineState):
+        """
+        Fetches the prompts from Langfuse and creates the prompt
+
+        Args:
+            state (GraphState): The graph state
+
+        Returns:
+            dict: The prompt text for the active chapter
+        """
+
+        # Fetch current Chatper
+        ch = state.chapter
+
+        logging.info(f"create_prompt_node started for {state.folder_num}, ch {ch}")
+        # Initialize the langfuse client
+        langfuse_client = langfuse.get_client()
+
+        # Get the prompt label (e.g., 'latest', 'production', ...)
+        prompt_label = state.chapter_timeline_config.llm_call_config.prompt_label
+
+        logging.info(f"create_prompt_node using '{prompt_label}' for {state.folder_num}, ch {ch}")
+        # Prompt Retrieval
+        # In langfuse, the set up is each chapter will have prompts under:
+        #  `timeline/ch{ch#}/_____`
+        # These may, by reference within langfuse, use defaults contained in
+        # `timeline/*_default`
+
+        # Retrieve the Chapter Prompt Template. If it doesn't exist, use the default
+
+        # TODO: pre-fetch prompts at startup
+        # https://langfuse.com/docs/prompt-management/features/caching#optional-customize-caching-duration-ttl
+        if prompt_label == 'latest':
+            cache_ttl_seconds = 0
+        else:
+            cache_ttl_seconds = 300
+        prompt_template = langfuse_client.get_prompt(f"timeline/ch{ch}/template",
+                                                      label=prompt_label, cache_ttl_seconds=cache_ttl_seconds)
+        mer_markdown = state.mer_markdown
+
+        prompt_sections = {}
+        for variable in prompt_template.variables:
+            if variable == 'MER':
+                prompt_sections[variable] = mer_markdown
+                continue
+            prompt_name = f"timeline/ch{ch}/{variable}"
+            prompt_sections[variable] = langfuse_client.get_prompt(
+                                    prompt_name, label=prompt_label, cache_ttl_seconds=cache_ttl_seconds).compile()
+
+        prompt = prompt_template.compile(**prompt_sections)
+
+        logging.info(f"create_prompt_node completed for {state.folder_num}, ch {ch}")
+
+        # Return the prompt
+        return {'prompt': prompt, 'prompt_sections': prompt_sections}
+
+
+    @staticmethod
+    async def set_llm_shuttle_node(state: ChapterTimelineState):
+        """Set up the LLM config for chapter timeline
+
+        Args:
+            state (ChapterTimelineState): The graph state for chapter timeline
+
+        Returns:
+            dict: The dict with the LLM shuttle
+        """
+        logging.info(f'set_llm_shuttle_node started for {state.folder_num}, {state.chapter}...')
+        llm_config = state.chapter_timeline_config.llm_call_config
+
+        # Set the Structured output format for Azure to use
+        if llm_config.return_structured_output:
+            llm_config.output_structure = TimelineResponseStructure
+
+        # Place Prompt on deck (Copy + update for mutability)
+        azure_llm_shuttle = (state.azure_llm_shuttle
+                    .model_copy(update={
+                        'prompt_deck': state.prompt,
+                        'prompt_deck_sections': state.prompt_sections,
+                        'llm_call_config': state.chapter_timeline_config.llm_call_config
+                        }))
+        logging.info(f'set_llm_shuttle_node completed for {state.folder_num}, {state.chapter}...')
+        return {'azure_llm_shuttle': azure_llm_shuttle}
+
+
+    @staticmethod
+    async def receive_llm_shuttle_node(state: ChapterTimelineState):
+        """Receives and return the response from the LLM
+
+        Args:
+            state (ChapterTimelineState): The graph state for chapter timeline
+
+        Raises:
+            Exception: if a parsing error was encountered
+
+        Returns:
+            dict: The dict with the chapter timeline LLM response
+        """
+        response = state.azure_llm_shuttle.llm_response
+
+        logging.info(f'receive_llm_shuttle_node started for {state.folder_num}, ch {state.chapter}...')
+
+        if state.chapter_timeline_config.llm_call_config.return_structured_output:
+            if response['parsing_error']:
+                # If a parsing error was encountered in generating the structured ouput
+                # do something here to manually parse out the raw llm repsonse (d['raw'])
+                raise Exception(f'Not implemented!')
+
+            timeline_response = response['parsed']
+
+            # Convert Events from TimelineEventStructure to TimelineEvent
+            # Allows adding additional variables to event
+            events = [TimelineEvent(**dict(event)) for event in timeline_response.events]
+
+            logging.info(f'receive_llm_shuttle_node completed for {state.folder_num}, ch {state.chapter}...')
+            return {'events': events,
+                    'response_raw': response['raw'].content
+                    }
+        else:
+            logging.info(f'receive_llm_shuttle_node completed for {state.folder_num}, ch {state.chapter}...')
+            # If not structured response, assume the LLM will return markdown natively
+            return {'markdown_output': response.content}
+
+
+    @staticmethod
+    async def replace_citations_node(state: ChapterTimelineState):
+        """
+        Replace the citations node
+
+        Args:
+            state (GraphState): The graph stsate
+
+        Returns:
+            dict: The dict with altered markdown_output citing to annotation_id
+        """
+        logging.info(f'replace_citations_node started for {state.folder_num}, ch {state.chapter}...')
+        # Get Markdown
+        markdown_output = state.markdown_output
+
+        # If structured output is requested, initialize that stuff here
+        structured_sw = state.chapter_timeline_config.llm_call_config.return_structured_output
+
+        if structured_sw:
+            events=copy.deepcopy(state.events)
+            markdown_output=copy.deepcopy(state.markdown_output)
+
+            # Check if citation field is present in the strucutred output. If not,
+            # set the return_structured_output to false so you don't do anything
+            # further below
+            if 'citation' not in events[0].model_fields:
+                structured_sw=False
+
+        for cite_id, annotation_id in state.mer_citation_lookup.items():
+            str_replacement = f'[evidence_{cite_id}](#V-{annotation_id})'
+            markdown_output = re.sub(fr"evidence_{cite_id}\b", str_replacement,
+                                markdown_output)
+            if not structured_sw:
+                continue
+
+            # Update the structured ouput
+
+            # Update the parsed (structured) structured output. NOTE:
+            # This is super clunky with two nested for loops. The outer
+            # to loop annotation lookup dict and this one to loop over
+            # the timeline events
+            for i, event in enumerate(events):
+                if isinstance(event.citation, str):
+                    citation=event.citation
+                else:
+                    citation=", ".join(event.citation)
+                events[i].citation = re.sub(fr"evidence_{cite_id}\b",
+                                str_replacement, citation)
+
+        # Initialize the output
+        output={'markdown_output': markdown_output}
+
+        # Add the updates back into the the structured response object, and
+        # then add that in to the output dict
+        if  structured_sw:
+            output['events'] = events
+        logging.info(f'replace_citations_node finished for {state.folder_num}, ch {state.chapter}...')
+        return output
+
+    @staticmethod
+    async def save_response_node(state: ChapterTimelineState):
+        """Used as an "END" node after conditional branch
+
+        Args:
+            state (ChapterTimelineState): The graph state for chapter timeline
+        """
+        # No longer Needed but keeping to have an "END" Node after conditional branch
+        return {}
+
+
+    @staticmethod
+    async def validate_events_node(chapter_timeline_validation_state: ChapterTimelineValidationState):
+        logging.info(f'validate_events_node finished for {chapter_timeline_validation_state.folder_num}, ch{chapter_timeline_validation_state.chapter}')
+        events = chapter_timeline_validation_state.events
+        ch = chapter_timeline_validation_state.chapter
+
+        statements = [LLMSelfCheckNode.event_to_statement(event) for event in events]
+        validation_states = [ValidationState(
+                folder_num = chapter_timeline_validation_state.folder_num,
+                chapter = '',
+                statement = statement,
+                checks = 0,
+                fac = chapter_timeline_validation_state.fac,
+                uid = f"{chapter_timeline_validation_state.folder_num}.Ch{chapter_timeline_validation_state.chapter}.Event{str(i).zfill(3)}",
+                validation_config = chapter_timeline_validation_state.chapter_timeline_config.validation_config
+        ) for i, statement in enumerate(statements)]
+        logging.info(f'validate_events_node finished for {chapter_timeline_validation_state.folder_num}, ch{chapter_timeline_validation_state.chapter}')
+        return [Send(f"invoke_llm_self_check_node_{ch}", validation_state)
+                for validation_state in validation_states]
+
+    @staticmethod
+    async def recombine_timeline_node(chapter_timeline_validation_state: ChapterTimelineValidationState):
+        logging.info(f'recombine_timeline_node started for {chapter_timeline_validation_state.folder_num} {chapter_timeline_validation_state.chapter}')
+
+        events = chapter_timeline_validation_state.events
+        validation_states = chapter_timeline_validation_state.validation_states
+        statements = [validation_state.statement for validation_state in validation_states]
+
+        assert len(events) == len(validation_states)
+        for i, (statement, event) in enumerate(zip(statements, events)):
+            events[i] = event.model_copy(update={
+                'event_text': statement.statement_text,
+                'citation': statement.citation,
+                'rewrites': statement.rewrites,
+            })
+
+        logging.info(f'recombine_timeline_node finished for {chapter_timeline_validation_state.folder_num} {chapter_timeline_validation_state.chapter}')
+
+        return {"events": events}
+
+    @staticmethod
+    async def set_overview_statement_llm_shuttle_node(state: ChapterTimelineState):
+
+        """Set up the LLM config for writing the chapter overview
+
+        Args:
+            state (ChapterTimelineState): The graph state for chapter timeline
+
+        Returns:
+            dict: The dict with the LLM shuttle
+        """
+        logging.info(f'setting llm_shuttle for overview statement started for {state.folder_num}, ch{state.chapter}')
+        # Initialize the langfuse client
+        langfuse_client = langfuse.get_client()
+
+        # Remove structured response formatting for overview
+        llm_config = state.chapter_timeline_config.llm_call_config.model_copy(
+            update={'output_structure': None,
+                    'return_structured_output': False,
+            }
+        )
+        # Get previously generated teimline
+        timeline_summary = ''
+        for i, event in enumerate(state.events):
+            event_t = f'## event_{i}\n'
+            event_t += f'Date: {event.date_machine}\n'
+            event_t += event.event_text + "\n\n"
+            timeline_summary += event_t
+
+        # Form the prompt
+        prompt_label = state.chapter_timeline_config.llm_call_config.prompt_label
+        prompt_template = langfuse_client.get_prompt(f"timeline/ch{state.chapter}/chapter_overview",
+                                                      label=prompt_label, cache_ttl_seconds=300)
+        prompt = prompt_template.compile(timeline_summary=timeline_summary)
+
+        # Place Prompt on deck (Copy + update for mutability)
+        azure_llm_shuttle = (state.azure_llm_shuttle
+                    .model_copy(update={
+                        'prompt_deck': prompt,
+                        'llm_call_config': llm_config
+                        }))
+        logging.info(f'set_llm_shuttle_node for overview statement completed for {state.folder_num}, {state.chapter}...')
+
+        return {'azure_llm_shuttle': azure_llm_shuttle}
+
+
+    @staticmethod
+    async def receive_llm_shuttle_overview_statement_node(state: ChapterTimelineState):
+        """Receives and return the response from the LLM from overview creation
+
+        Args:
+            state (ChapterTimelineState): The graph state for chapter timeline
+
+        Returns:
+            dict: The dict with the chapter timeline LLM response
+        """
+
+        logging.info(f'receive_overview_statement_llm_shuttle_node started for {state.folder_num}, ch {state.chapter}...')
+
+        response = state.azure_llm_shuttle.llm_response
+
+        logging.info(f'receive_llm_shuttle_overview_statement_node completed for {state.folder_num}, ch {state.chapter}...')
+        # If not structured response, assume the LLM will return markdown natively
+        return {'chapter_overview': response.content}
+
+    @staticmethod
+    async def update_markdown_with_overview(state: ChapterTimelineState):
+        """Receives and return the response from the LLM from overview creation
+
+        Args:
+            state (ChapterTimelineState): The graph state for chapter timeline
+
+        Returns:
+            dict: The dict with the chapter timeline LLM response
+        """
+        logging.info(f'update_markdown_with_overview started for {state.folder_num}, ch {state.chapter}...')
+
+        response = state.azure_llm_shuttle.llm_response
+
+        # Remove citations from markdown version
+        regex_pattern = r'''[\[\(]\s*(?:events?_\d+(?:-\d+)?\s*(?:,\s*events?_\d+(?:-\d+)?\s*)*)[\]\)]'''
+        overview = re.sub(regex_pattern, "", response.content )
+
+        markdown_output = "*_Overview_*\n\n" + overview + "\n\n" + state.markdown_output
+
+        logging.info(f'update_markdown_with_overview completed for {state.folder_num}, ch {state.chapter}...')
+
+        # If not structured response, assume the LLM will return markdown natively
+        return {'markdown_output': markdown_output}
+
+    @staticmethod
+    async def create_structured_response_node(state: ChapterTimelineState):
+        """Receives and return the response from the LLM from overview creation
+
+        Args:
+            state (ChapterTimelineState): The graph state for chapter timeline
+
+        Returns:
+            dict: The dict with the chapter timeline LLM response
+        """
+        logging.info(f'create_structured_response_node started for {state.folder_num}, ch {state.chapter}...')
+
+        ## 1. Prepare overview for structured output
+        # Chapter Overview comes in as a paragraph with LLM created citations.
+        # parse_evidence_citations expects one sentence at a time, ending with
+        # the citation. So first, split into sentences via regex
+        citation_pattern = '''\(([^)]*evidence_\d+(?:-\d+)?(?:,\s*evidence_\d+(?:-\d+)?)*[^)]*)\)'''
+        l = re.split(citation_pattern, state.chapter_overview.replace('event_', 'evidence_'))
+
+        # Handle case where last sentence is uncited
+        if len(l) % 2 == 1:
+            l.append('')
+
+        # Put it in a list of tuples [(sentence, citation), ... ]
+        sentence_citation_pairs = list(zip(l[::2], l[1:][::2]))
+
+        # Do processing on evidence citations
+        sentence_citation_pairs_parsed = []
+        for sentence, citation in sentence_citation_pairs:
+            # Parse evidence citations, replace event with evidence for compatibility
+            parsed_citation = parse_evidence_citations(citation.replace('event_', 'evidence_')
+                                                               .replace('events_', 'evidence_'))
+            # Get integer index from each citation
+            citation_index = [int(citation.split("_")[1]) for citation in parsed_citation]
+            # Resave off
+            sentence_citation_pairs_parsed.append({'text': sentence, 'cite': citation_index})
+
+        # 2. Prepare Timeline for structured output
+        dates = []
+        for event_i, event in enumerate(state.events):
+            # Occasionally event_text includes citations as well, so clear that out
+            regex_pattern = r'''[\[\(]\s*(?:evidence_\d+(?:-\d+)?\s*(?:,\s*evidence_\d+(?:-\d+)?\s*)*)[\]\)]'''
+            event_text = re.sub(regex_pattern, "", event.event_text)
+
+            pattern = r'#V-([a-f0-9]{24})' # Match all Viewer Annotations
+            viewer_annotations_list = re.findall(pattern, event.citation)
+
+            # Organize Viewer Annotations by doc for ui
+            viewer_annotations = {}
+            for viewer_annotation in viewer_annotations_list:
+                doc_id = state.folder_dao.viewer_annotation_to_doc_map[viewer_annotation]
+                if doc_id not in viewer_annotations:
+                    viewer_annotations[doc_id] = []
+                viewer_annotations[doc_id].append(viewer_annotation)
+            viewer_annotations = list({'documentId': k,
+                                       'annotationIds': v
+                                       } for k, v in viewer_annotations.items())
+
+            tags = []
+            if event.includes_possible_handwriting:
+                tags.append("hw")
+            dates.append({
+                'date': event.date_machine,
+                'full_date_string': event.date_display,
+                'short_description': event.short_description,
+                'full_str': event_text,
+                'tags': tags,
+                'event_i': event_i,
+                'citation': event.citation, #str,
+                'event_text_wo_citations': event_text,
+                'annotations': viewer_annotations, #List[dict]
+                'ui_tags': [], # List[str]
+            })
+            if event.includes_possible_handwriting:
+                dates[-1]['ui_tags'].append('includes_possible_handwriting')
+
+        # Finalize structured timeline
+        structured_timeline = {
+            'overview': sentence_citation_pairs_parsed,
+            'dates': dates
+        }
+        return {'structured_timeline': structured_timeline}
+
+
+
+    @staticmethod
+    async def load_archived_summary_node(state: ChapterTimelineState):
+        """
+        TODO: update mongo reading
+
+        Method to load the most recent archived summary.
+
+        Args:
+            state (ChapterTimelineState): The graph state for chapter timeline
+
+        Returns:
+            dict: The dict with archived_summary.
+                  Returning it with None will force rewrite from scratch
+        """
+
+        logging.info(f'load_prior_summary_node started {state.folder_num}, ch {state.chapter}...')
+        progressive_summary_config = state.chapter_timeline_config.progressive_summary_config
+        # Check if we want to do progressive summary. If not, return None as archive
+        if not progressive_summary_config.do_progressive_summary:
+            logging.info(f'load_prior_summary_node skipped {state.folder_num}, ch {state.chapter}...')
+            return {'archived_summary': None}
+
+        # Mongo not yet support
+        if progressive_summary_config.archive_mode == 'mongo':
+            raise "Only JSON mode is implemented"
+        else:
+            # Directyr of locally saved files
+            directory = 'archived_summaries_pii'
+            try:
+                filenames = os.listdir(directory)
+            except:
+                # If directory doesnt exist, return none
+                return {'archived_summary': None}
+
+
+            # Filter to the current folder number
+            archived_summaries = [filename for filename in filenames if str(state.folder_num) in filename]
+
+            # If there are no summaries, return None
+            if len(archived_summaries) == 0:
+                return {'archived_summary': None}
+
+            # Get number of documents used in archived summaries
+            # This is included in the file name format
+            # archived_summary-{foldernum}-structured_timeline-7.json
+            # where the above summary was made with 7 documents
+            n_docs_in_archived_summaries = [int(filename.split('-')[-1][:-5]) for filename in filenames ]
+
+            # Check how many documents we currently have
+            n_docs_currently = state.folder_dao.documents_df['document_id'].nunique()
+
+            # Filter out any with more docs than we have
+            n_docs_in_archived_summaries = [n for n in n_docs_in_archived_summaries
+                                            if n <= n_docs_currently]
+
+            # If we want to force a rewrite, we want to ignore any summary with the exact
+            # same number of documents
+            if progressive_summary_config.force_rewrite:
+                logging.info(f'load_archived_summary_node forcing_rewrite for {state.folder_num}')
+                if n_docs_currently in n_docs_in_archived_summaries:
+                    n_docs_in_archived_summaries.remove(n_docs_currently)
+
+            # If there are no summaries, return None
+            if len(n_docs_in_archived_summaries) == 0:
+                return {'archived_summary': None}
+
+            # Get the latest summary with teh most number of documents
+            latest_archived_result = max(n_docs_in_archived_summaries)
+            latest_archived_filename = f'archived_summary-{state.folder_num}'\
+                                       f'-structured_timeline-{latest_archived_result}.json'
+
+            # Read the summary
+            with open(os.path.join(directory, latest_archived_filename), 'r') as f:
+                logging.info(f'loading {latest_archived_filename} - {state.folder_num}, ch {state.chapter}...')
+                archived_summary = json.load(f)
+
+            # If the prior summary didnt include this chapter, we need to rewrite
+            if state.chapter not in archived_summary['chapters']:
+                return {'archived_summary': None}
+
+            #return the archived summary
+            return {'archived_summary': archived_summary}
+
